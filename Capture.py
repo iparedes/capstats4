@@ -79,6 +79,7 @@ class Capture():
             a=str(self.processed_packets)+"/"+str(self.npackets)
             print "{}\r".format(a),
         # OjO aqui
+        print "\n"
         self.__flush()
         self.dbsession.flush()
         self.dbsession.commit()
@@ -185,51 +186,69 @@ class Capture():
         for o in orphans:
             (c,conv)=self.__match_conversation_sql(o.ipsrc,o.portsrc,o.ipdst,o.portdst,o.proto)
             if (c=='?'):
-                ## CHECK IF THIS WORKS
+                # does not belong to a conversation
+                # let's check if there is any matching server
                 s={'port':o.portsrc,'proto':o.proto,'ip':o.ipsrc}
                 if s in self.servers:
                     self.__add_conv_sql(o.ipdst,o.ipsrc,o.proto,o.portsrc,o.bytes)
+                    self.dbsession.delete(o)
+                    self.dbsession.flush()
                     continue
-                    #return "Srv "+o.proto+"/"*str(o.portsrc)
-                s={'port':o.portdst,'proto':o.proto,'ip':o.ipdst}
-                if s in self.servers:
-                    self.__add_conv_sql(o.ipsrc,o.ipdst,o.proto,o.portdst,o.bytes)
-                    continue
-                    #return "Srv "+o.proto+"/"*str(o.portdst)
+                else:
+                    s={'port':o.portdst,'proto':o.proto,'ip':o.ipdst}
+                    if s in self.servers:
+                        self.__add_conv_sql(o.ipsrc,o.ipdst,o.proto,o.portdst,o.bytes)
+                        self.dbsession.delete(o)
+                        self.dbsession.flush()
+                        continue
             else:
+                # belongs to a conversation
                 conv.packets+=1
                 conv.bytes+=o.bytes
-                #self.dbsession.delete(o)
-                #self.dbsession.flush()
+                self.dbsession.delete(o)
+                self.dbsession.flush()
                 continue
 
         # if an endpoint is in two orphans lets assume that's the server
-        #orphans=self.dbsession.query(orphan).filter(orphan.capture_id==self.dbcapture.id).all()
+        orphans=self.dbsession.query(orphan).filter(orphan.capture_id==self.dbcapture.id).all()
         cont=0
-        o,orphans=orphans[0],orphans[1:]
+        #borrar=[]
         while len(orphans)>1:
+            o,orphans=orphans[0],orphans[1:]
             found=self.__match_orphan((o.ipsrc,o.portsrc,o.proto),orphans)
             if len(found)>0:
                 c=self.__add_conv_sql(o.ipdst,o.ipsrc,o.proto,o.portsrc,o.bytes)
-                ## MAL. NEED TO REWRITE THIS WHOLE METHOD
                 self.dbsession.delete(o)
-                for f in found:
-                    c.packets+=1
-                    c.bytes+=f[1].bytes
-                    self.dbsession.delete(f[1])
                 self.dbsession.flush()
+                #borrar.append(o)
+                for f in found:
+                    if f[0]=='<':
+                        c=self.__add_conv_sql(f[1].ipdst,f[1].ipsrc,f[1].proto,f[1].portsrc,f[1].bytes)
+                    else:
+                        c=self.__add_conv_sql(f[1].ipsrc,f[1].ipdst,f[1].proto,f[1].portdst,f[1].bytes)
+                    orphans.remove(f[1])
+                    self.dbsession.delete(f[1])
+                    self.dbsession.flush()
+                    #borrar.append(f[1])
             else:
                 found=self.__match_orphan((o.ipdst,o.portdst,o.proto),orphans)
                 if len(found)>0:
                     c=self.__add_conv_sql(o.ipsrc,o.ipdst,o.proto,o.portdst,o.bytes)
                     self.dbsession.delete(o)
-                    for f in found:
-                        c.packets+=1
-                        c.bytes+=f[1].bytes
-                        self.dbsession.delete(f[1])
                     self.dbsession.flush()
+                    #borrar.append(o)
+                    for f in found:
+                        if f[0]=='<':
+                            c=self.__add_conv_sql(f[1].ipdst,f[1].ipsrc,f[1].proto,f[1].portsrc,f[1].bytes)
+                        else:
+                            c=self.__add_conv_sql(f[1].ipsrc,f[1].ipdst,f[1].proto,f[1].portdst,f[1].bytes)
+                        orphans.remove(f[1])
+                        self.dbsession.delete(f[1])
+                        self.dbsession.flush()
+                        #borrar.append(f[1])
             cont+=1
-            o,orphans=orphans[0],orphans[1:]
+
+        self.dbsession.commit()
 
 
     def reverse_orphan(self,i):
@@ -311,12 +330,12 @@ class Capture():
             ep2=(i.ipsrc,i.portsrc,i.proto)
             if ep==ep2:
                 found.append(("<",i))
-                l.remove(i)
+                #l.remove(i)
                 continue
             ep2=(i.ipdst,i.portdst,i.proto)
             if ep==ep2:
                 found.append((">",i))
-                l.remove(i)
+                #l.remove(i)
                 continue
         return found
 
