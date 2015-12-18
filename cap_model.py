@@ -13,7 +13,7 @@ class capture (Base):
     __tablename__ = "capture"
     id = Column('id', Integer, primary_key = True)
     filename=Column('filename',String)
-    description = deferred(Column('Description', Text))
+    description = deferred(Column('description', Text))
     ips=relationship("ip",backref="capture")
     conversations=relationship("conversation",backref="capture")
     orphans=relationship("orphan",backref="capture")
@@ -62,3 +62,11 @@ class service(Base):
     proto = Column('proto',Unicode)
     description=Column('description',Unicode)
     capture_id=Column(Integer,ForeignKey('capture.id'))
+
+
+class wkservice(Base):
+    __tablename__="wkservice"
+    id=Column('id',Integer,primary_key=True)
+    port = Column('port',Integer)
+    proto = Column('proto',Unicode)
+    description=Column('description',Unicode)

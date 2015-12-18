@@ -27,7 +27,7 @@
     <service>
         <proto>TCP</proto>
         <port>80</port>
-        <description>DNS</description>
+        <description>HTTP</description>
     </service>
     <service>
         <proto>TCP</proto>

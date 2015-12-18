@@ -23,16 +23,131 @@ class Capture():
         self.dbsession=Session()
         Base.metadata.create_all(engine)
 
-
         self.__well_known_tcp=dict()
         self.__well_known_udp=dict()
-        self.__load_ports_from_xml()
+        v=self.dbsession.query(wkservice).all()
+        if len(v)==0:
+            # First execution
+            # populates db from xml
+            self.__load_ports_from_xml()
+            for s in self.__well_known_tcp:
+                sv=wkservice(port=s,proto=u"tcp",description=self.__well_known_tcp[s])
+                self.dbsession.add(sv)
+            for s in self.__well_known_udp:
+                sv=wkservice(port=s,proto=u"udp",description=self.__well_known_udp[s])
+                self.dbsession.add(sv)
+            self.dbsession.flush()
+            self.dbsession.commit()
+        else:
+            # load services from db
+            svcs=self.dbsession.query(wkservice).all()
+            for s in svcs:
+                if s.proto==u"tcp":
+                    l=self.__well_known_tcp
+                else:
+                    l=self.__well_known_udp
+                l[s.port]=s.description
+
+        self.stats=dict()
 
         self.__ips=dict()
         self.__convs=[]
         self.__servers=[]
+        self.__services=[]
         self.__orphans=[]
         self.dbcapture=None
+
+    def statistics(self):
+        orphans=self.dbsession.query(orphan).filter(orphan.capture_id==self.dbcapture.id).all()
+        conversations=self.dbsession.query(conversation).filter(conversation.capture_id==self.dbcapture.id).all()
+        self.stats['id']=self.dbcapture.id
+        a=self.dbsession.query(capture).filter(capture.id==self.dbcapture.id).first()
+        self.stats['filename']=a.filename
+        self.stats['description']=a.description
+        self.stats['norphans']=len(orphans)
+        self.stats['nconversations']=len(conversations)
+        self.stats['bytes']=0
+        self.stats['packets']=0
+        self.stats['packets_tcp']=0
+        self.stats['bytes_tcp']=0
+        self.stats['packets_udp']=0
+        self.stats['bytes_udp']=0
+        self.stats['packets_other']=0
+        self.stats['bytes_other']=0
+        self.stats['bytes_tcpshare']=dict()
+        self.stats['bytes_udpshare']=dict()
+        self.stats['pkts_tcpshare']=dict()
+        self.stats['pkts_udpshare']=dict()
+        for c in conversations:
+            #self.stats['nconversations']+=1
+            self.stats['packets']+=c.packets
+            self.stats['bytes']+=c.bytes
+            if c.proto==u"tcp":
+                self.stats['packets_tcp']+=c.packets
+                self.stats['bytes_tcp']+=c.bytes
+                if c.port in self.stats['pkts_tcpshare']:
+                    self.stats['bytes_tcpshare'][c.port]+=c.bytes
+                    self.stats['pkts_tcpshare'][c.port]+=c.packets
+                else:
+                    self.stats['bytes_tcpshare'][c.port]=c.bytes
+                    self.stats['pkts_tcpshare'][c.port]=c.packets
+            elif c.proto==u"udp":
+                self.stats['packets_udp']+=c.packets
+                self.stats['bytes_udp']+=c.bytes
+                if c.port in self.stats['pkts_udpshare']:
+                    self.stats['bytes_udpshare'][c.port]+=c.bytes
+                    self.stats['pkts_udpshare'][c.port]+=c.packets
+                else:
+                    self.stats['bytes_udpshare'][c.port]=c.bytes
+                    self.stats['pkts_udpshare'][c.port]=c.packets
+
+            else:
+                self.stats['packets_other']+=c.packets
+                self.stats['bytes_other']+=c.packets
+        return self.stats
+
+    def proto_share(self,proto=u"tcp",type="packets"):
+        """
+        :param proto: tcp | udp
+        :param type: packets | bytes
+        :return: dictionary. key=proto, value=sum of type
+        """
+        tcp_convs=self.dbsession.query(conversation).filter(conversation.proto==proto,
+                                                            conversation.capture_id==self.dbcapture.id)
+        d=dict()
+        for c in tcp_convs:
+            if c.port in d:
+                d[c.port]+=getattr(c,type)
+            else:
+                d[c.port]=getattr(c,type)
+        return d
+
+
+    def service_name(self,proto,port):
+        """
+        :param proto: tcp || udp
+        :param port: port number (integer)
+        :return: description of the proto/port in the capture, or ? if not available
+        """
+        n=self.dbsession.query(service).filter(service.capture_id==self.dbcapture.id,
+                                               service.proto==proto,service.port==port).all()
+        if len(n)>0:
+            return n[0].description
+        else:
+            return '?'
+
+    def set_service_name(self,proto,port,description):
+        """
+        :param proto: tcp || udp
+        :param port: port number (integer)
+        :param description: Description of the service (string)
+        :return:
+        """
+        n=self.dbsession.query(service).filter(service.capture_id==self.dbcapture.id,
+                                               service.proto==proto,service.port==port).first()
+        n.description=description
+        self.dbsession.flush()
+        self.dbsession.commit()
 
 
     def __load_ports_from_xml(self):
@@ -41,7 +156,7 @@ class Capture():
         for s in itemlist:
             proto=s.getElementsByTagName('proto')[0].firstChild.data
             descr=s.getElementsByTagName('description')[0].firstChild.data
-            port=s.getElementsByTagName('port')[0].firstChild.data
+            port=int(s.getElementsByTagName('port')[0].firstChild.data)
             if proto=="TCP":
                 l=self.__well_known_tcp
             else:
@@ -65,11 +180,23 @@ class Capture():
             self.__convs=[]
             self.__servers=[]
             self.__orphans=[]
-
+            self.__services=[]
+            # Log
+            print "Analyzing packets..."
+            #
             self.analyze()
+            # Log
+            print "Analyzing orphans..."
+            #
+            self.analyze_orphans()
+            self.statistics()
+            # Log
+            print "Conversations: "+str(self.stats['nconversations'])
+            print "Orphans: "+str(self.stats['norphans'])
             return 1
         except IOError:
             return 0
+
 
     def analyze(self):
         for ts,buf in self.pcap:
@@ -148,13 +275,6 @@ class Capture():
                 # If multicast assume the destination as the server in the conversation
                 self.__add_conv(pkt['ipsrc'],pkt['ipdst'],pkt['proto'],pkt['portdst'],pkt['bytes'])
                 return "Multicast"
-            # if well known port
-            if self.__is_well_known(pkt['portsrc'],pkt['proto']):
-                self.__add_conv(pkt['ipdst'],pkt['ipsrc'],pkt['proto'],pkt['portsrc'],pkt['bytes'])
-                return "Port "+str(pkt['portsrc'])
-            if self.__is_well_known(pkt['portdst'],pkt['proto']):
-                self.__add_conv(pkt['ipsrc'],pkt['ipdst'],pkt['proto'],pkt['portdst'],pkt['bytes'])
-                return "Port "+str(pkt['portdst'])
 
             # if end of conversation matches
             s={'port':pkt['portsrc'],'proto':pkt['proto'],'ip':pkt['ipsrc']}
@@ -165,6 +285,24 @@ class Capture():
             if s in self.__servers:
                 self.__add_conv(pkt['ipsrc'],pkt['ipdst'],pkt['proto'],pkt['portdst'],pkt['bytes'])
                 return "Srv "+pkt['proto']+"/"+str(pkt['portdst'])
+
+            # if some of the endpoints matches a service
+            if self.__is_service(pkt['portsrc'],pkt['proto']):
+                self.__add_conv(pkt['ipdst'],pkt['ipsrc'],pkt['proto'],pkt['portsrc'],pkt['bytes'])
+                return "Svc"+pkt['proto']+"/"+str(pkt['portsrc'])
+            if self.__is_service(pkt['portdst'],pkt['proto']):
+                self.__add_conv(pkt['ipsrc'],pkt['ipdst'],pkt['proto'],pkt['portdst'],pkt['bytes'])
+                return "Svc"+pkt['proto']+"/"+str(pkt['portdst'])
+
+
+            # if well known port
+            if self.__is_well_known(pkt['portsrc'],pkt['proto']):
+                self.__add_conv(pkt['ipdst'],pkt['ipsrc'],pkt['proto'],pkt['portsrc'],pkt['bytes'])
+                return "Port "+str(pkt['portsrc'])
+            if self.__is_well_known(pkt['portdst'],pkt['proto']):
+                self.__add_conv(pkt['ipsrc'],pkt['ipdst'],pkt['proto'],pkt['portdst'],pkt['bytes'])
+                return "Port "+str(pkt['portdst'])
+
 
             # if get here, then add orphan
             self.__add_orphan(pkt)
@@ -177,13 +315,21 @@ class Capture():
             #self.dbsession.flush()
             return "+"
 
+    # def analyze_orphans(self):
+    #     self.__analyze_orphans()
+
+
     def analyze_orphans(self):
-        self.__analyze_orphans()
-
-
-    def __analyze_orphans(self):
         orphans=self.dbsession.query(orphan).filter(orphan.capture_id==self.dbcapture.id).all()
+        # Log
+        print "First round..."
+        num=len(orphans)
+        #
         for o in orphans:
+            #Log
+            print '{0}\r'.format(num),
+            num-=1
+            #
             (c,conv)=self.__match_conversation_sql(o.ipsrc,o.portsrc,o.ipdst,o.portdst,o.proto)
             if (c=='?'):
                 # does not belong to a conversation
@@ -201,6 +347,17 @@ class Capture():
                         self.dbsession.delete(o)
                         self.dbsession.flush()
                         continue
+                # now check if is well known service
+                if self.__is_well_known(o.portsrc,o.proto):
+                    self.__add_conv_sql(o.ipdst,o.ipsrc,o.proto,o.portsrc,o.bytes)
+                    self.dbsession.delete(o)
+                    self.dbsession.flush()
+                    continue
+                elif self.__is_well_known(o.portdst,o.proto):
+                    self.__add_conv_sql(o.ipsrc,o.ipdst,o.proto,o.portsrc,o.bytes)
+                    self.dbsession.delete(o)
+                    self.dbsession.flush()
+                    continue
             else:
                 # belongs to a conversation
                 conv.packets+=1
@@ -211,9 +368,17 @@ class Capture():
 
         # if an endpoint is in two orphans lets assume that's the server
         orphans=self.dbsession.query(orphan).filter(orphan.capture_id==self.dbcapture.id).all()
-        cont=0
+        # Log
+        print "Second round..."
+        num=len(orphans)
+        #
+        #cont=0
         #borrar=[]
         while len(orphans)>1:
+            # Log
+            print '{0}\r'.format(num),
+            num-=1
+            #
             o,orphans=orphans[0],orphans[1:]
             found=self.__match_orphan((o.ipsrc,o.portsrc,o.proto),orphans)
             if len(found)>0:
@@ -246,7 +411,7 @@ class Capture():
                         self.dbsession.delete(f[1])
                         self.dbsession.flush()
                         #borrar.append(f[1])
-            cont+=1
+            #cont+=1
 
         self.dbsession.commit()
 
@@ -286,6 +451,38 @@ class Capture():
         for c in self.dbsession.query(conversation).filter(conversation.capture_id==capid).all():
             self.__add_conv(c.ipsrc_ip,c.ipdst_ip,c.proto,c.port,c.bytes,c.packets)
 
+    def merge(self):
+        orphans=self.dbsession.query(orphan).all()
+        for o in orphans:
+            self.__add_conv_sql(o.ipsrc,o.ipdst,o.proto,o.portdst,o.bytes,o.packets)
+            self.dbsession.delete(o)
+        self.dbsession.flush()
+        self.dbsession.commit()
+
+
+    def del_wkservice(self,proto,port):
+        s=self.dbsession.query(wkservice).filter(proto=proto,port=port).first()
+        if s != None:
+            self.dbsession.delete(s)
+            self.dbsession.flush(s)
+            self.dbsession.commit()
+            if proto==u"tcp":
+                l=self.__well_known_tcp
+            else:
+                l=self.__well_known_udp
+        del l[port]
+
+    # def add_wkservice(self,proto,port,description='-'):
+    #     s=wkservice(port=port,proto=proto,description=description)
+    #     self.dbsession.add(s)
+    #     self.dbsession.flush()
+    #     self.dbsession.commit()
+
+
+    def reset_wkservice(self):
+        self.dbsession.query(wkservice).delete()
+        self.dbsession.flush()
+        self.dbsession.commit()
 
     def __match_conversation(self,ip1,port1,ip2,port2,proto):
         possconv=[item for item in self.__convs if item['proto']==proto and item['port']==port1 and
@@ -344,7 +541,11 @@ class Capture():
         self.__convs.append(a)
         b={'proto':proto,'port':port,'ip':ipd}
         self.__servers.append(b)
+        c={'proto':proto,'port':port}
+        if c not in self.__services:
+            self.__services.append(c)
         return a
+
 
     def __add_conv_sql(self,ips,ipd,proto,port,packet_size,packets=1):
         """Adds a new (assumes doesn't exist previously) conversation to the current capture"""
@@ -355,6 +556,21 @@ class Capture():
                             capture_id=self.dbcapture.id,packets=packets,bytes=packet_size)
         self.dbsession.add(conv1)
         return conv1
+
+    def add_wkservice_sql(self,puerto,protocolo,descr='-'):
+        descr=unicode(descr)
+        protocolo=unicode(protocolo)
+        s=self.dbsession.query(wkservice).filter(wkservice.port==puerto,wkservice.proto==protocolo).all()
+        if len(s)==0:
+            sv=wkservice(port=puerto,proto=protocolo,description=descr)
+            self.dbsession.add(sv)
+            self.dbsession.flush()
+            self.dbsession.commit()
+            if protocolo==u"tcp":
+                l=self.__well_known_tcp
+            else:
+                l=self.__well_known_udp
+            l[puerto]=descr
 
     def __add_orphan(self,pkt):
         # macsrc,ipsrc,portsrc,macdst,ipdst,portdst,proto,bytes):
@@ -390,16 +606,19 @@ class Capture():
             conv=conversation(ipsrc_ip=c['ipsrc'],ipdst_ip=c['ipdst'],port=c['port'],proto=c['proto'],
                               packets=c['packets'],bytes=c['bytes'],capture_id=self.dbcapture.id)
             self.dbsession.add(conv)
-            serv=self.dbsession.query(service).filter(service.port==c['port'],service.proto==c['proto'],                                                      service.capture_id==self.dbcapture.id).first()
-            if serv==None:
-                # service not found, we add it
-                if c['proto']==u"tcp":
-                    descr=self.__well_known_tcp.get(str(c['port']),u"-")
-                else:
-                    descr=self.__well_known_udp.get(str(c['port']),u"-")
 
-                serv=service(port=c['port'],proto=c['proto'],description=descr,capture_id=self.dbcapture.id)
-                self.dbsession.add(serv)
+
+            #serv=self.dbsession.query(service).filter(service.port==c['port'],service.proto==c['proto'],
+                                                      #service.capture_id==self.dbcapture.id).first()
+
+        for c in self.__services:
+            if c['proto']==u"tcp":
+                descr=self.__well_known_tcp.get(c['port'],u"-")
+            else:
+                descr=self.__well_known_udp.get(c['port'],u"-")
+            serv=service(port=c['port'],proto=c['proto'],description=descr,capture_id=self.dbcapture.id)
+            self.dbsession.add(serv)
+
         for i in self.__ips:
             a=ip(ip=i,mac=self.__ips[i],capture_id=self.dbcapture.id)
             self.dbsession.add(a)
@@ -423,10 +642,19 @@ class Capture():
             l=self.__well_known_tcp
         else:
             l=self.__well_known_udp
-        if str(port) in l:
+        if port in l:
             return True
         else:
             return False
+
+    def __is_service(self,port,proto):
+        # checks if proto/port is part of the services found in the capture
+        a={'proto':proto,'port':port}
+        if a in self.__services:
+            return True
+        else:
+            return False
+
 
     @property
     def conversations(self):
@@ -443,7 +671,15 @@ class Capture():
 
     @property
     def services(self):
-        servs=self.dbsession.query(service).order_by(service.proto.asc(),service.port.asc()).all()
+        servs=self.dbsession.query(service).filter(service.capture_id==self.dbcapture.id).order_by(service.proto.asc(),\
+                                                                                                   service.port.asc()).all()
+        services=map(lambda s: (s.proto,s.port,s.description), servs)
+        return services
+
+
+    @property
+    def wkservices(self):
+        servs=self.dbsession.query(wkservice).order_by(wkservice.proto.asc(),wkservice.port.asc()).all()
         services=map(lambda s: (s.proto,s.port,s.description), servs)
         return services
 
@@ -460,3 +696,17 @@ class Capture():
         for i in p:
             servers.append((i.ipdst_ip,i.port,i.proto))
         return servers
+
+    def get_description(self):
+        p=self.dbsession.query(capture.description).filter(capture.id==self.dbcapture.id).first()
+        if p[0]==None:
+            return '-'
+        else:
+            return p[0]
+
+    def set_description(self,value):
+        p=self.dbsession.query(capture).filter(capture.id==self.dbcapture.id).first()
+        p.description=value
+        self.dbsession.commit()
+
+
